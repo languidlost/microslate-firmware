@@ -8,8 +8,8 @@ enum class SyncState : uint8_t {
   NETWORK_LIST,
   PASSWORD_ENTRY,
   CONNECTING,
-  SYNCING,         // Server running, tracking transfers
-  DONE,            // Summary shown, WiFi off, auto-return to menu
+  SYNCING,         // Git sync is in progress
+  DONE,            // Result shown, WiFi off, auto-return to menu
   CONNECT_FAILED,
   SAVE_PROMPT,
   FORGET_PROMPT
@@ -18,7 +18,7 @@ enum class SyncState : uint8_t {
 // Lifecycle
 void wifiSyncStart();       // Begin scanning (or auto-connect if saved creds)
 void wifiSyncStop();         // Stop everything, WiFi off
-void wifiSyncLoop();         // Poll scan/connection/HTTP
+void wifiSyncLoop();         // Poll scan, connection, and Git sync
 bool isWifiSyncActive();
 
 // For UI renderer
@@ -32,12 +32,7 @@ int  getSelectedNetwork();
 const char* getPasswordBuffer();
 int  getPasswordLen();
 const char* getSyncStatusText();
-
-// Sync progress
-int  getSyncFilesSent();
-int  getSyncFilesReceived();
-int  getSyncTotalFiles();
-bool isPcConnected();
+bool didGitSyncSucceed();
 
 // For input handler
 void syncHandleKey(uint8_t keyCode, uint8_t modifiers);

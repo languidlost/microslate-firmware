@@ -17,6 +17,7 @@
 #include "ui_renderer.h"
 #include "wifi_sync.h"
 #include "keyboard_layout.h"
+#include "git_sync.h"
 
 // Enum for sleep reasons
 enum class SleepReason {
@@ -69,6 +70,10 @@ int findBufferLen = 0;
 bool darkMode = false;
 bool cleanMode = false;
 bool deleteConfirmPending = false;
+char gitSyncNotice[64] = "";
+static bool sleepAfterGitSync = false;
+static bool skipGitSyncForNextSleep = false;
+static SleepReason sleepReasonAfterGitSync = SleepReason::IDLE_TIMEOUT;
 WritingMode writingMode = WritingMode::NORMAL;
 FontSize fontSize = FontSize::LARGE;
 bool showWordCount = true;
@@ -225,6 +230,10 @@ void setup() {
   editorInit();
   inputSetup();
   fileManagerSetup();
+  esp_err_t gitInitResult = git_sync_init();
+  if (gitInitResult != ESP_OK) {
+    DBG_PRINTF("Git sync initialization failed: %s\n", esp_err_to_name(gitInitResult));
+  }
 
   // Restore UI prefs from SD backup if NVS was wiped by a firmware flash
   if (!uiPrefs.isKey("orient")) {
@@ -299,6 +308,19 @@ void setup() {
 
 // Enter deep sleep - matches crosspoint pattern
 void enterDeepSleep(SleepReason reason) {
+  if (!skipGitSyncForNextSleep && git_sync_is_configured()) {
+    if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
+      saveCurrentFile();
+    }
+    sleepAfterGitSync = true;
+    sleepReasonAfterGitSync = reason;
+    wifiSyncStart();
+    currentState = UIState::WIFI_SYNC;
+    screenDirty = true;
+    return;
+  }
+  skipGitSyncForNextSleep = false;
+
   DBG_PRINTLN("Entering deep sleep...");
 
   // Stop watching the loop task — the sleep prep below (full refresh + waiting for
@@ -670,8 +692,13 @@ void loop() {
   // Process BLE (connection handling, scan completion detection)
   bleLoop();
 
-  // Process WiFi sync HTTP clients when active
+  // Process Git sync and WiFi connection setup while active
   if (isWifiSyncActive()) wifiSyncLoop();
+  if (sleepAfterGitSync && !isWifiSyncActive()) {
+    sleepAfterGitSync = false;
+    skipGitSyncForNextSleep = true;
+    enterDeepSleep(sleepReasonAfterGitSync);
+  }
 
   // CRITICAL: Process buttons BEFORE checking wasAnyPressed() to avoid consuming button states
   processPhysicalButtons();

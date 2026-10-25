@@ -4,6 +4,7 @@
 #include "ble_keyboard.h"
 #include "wifi_sync.h"
 #include "keyboard_layout.h"
+#include "git_sync.h"
 
 #include <Arduino.h>
 #include <SDCardManager.h>
@@ -64,6 +65,7 @@ extern int renameBufferLen;
 extern bool editorFindMode;
 extern char findBuffer[];
 extern int findBufferLen;
+extern char gitSyncNotice[];
 
 void inputSetup() {
   queueHead = 0;
@@ -148,6 +150,12 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
 
   // Ctrl shortcuts
   if (isCtrl(modifiers) && !isAltGr(modifiers)) {
+    if (keyCode == HID_KEY_G) {
+      wifiSyncStart();
+      currentState = UIState::WIFI_SYNC;
+      screenDirty = true;
+      return;
+    }
     if (keyCode == HID_KEY_S) {
       saveCurrentFile();
       screenDirty = true;
@@ -337,6 +345,7 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
 
 static void dispatchEvent(const KeyEvent& event) {
   if (!event.pressed) return;
+  gitSyncNotice[0] = '\0';
 
   switch (currentState) {
     case UIState::MAIN_MENU: {
@@ -376,10 +385,37 @@ static void dispatchEvent(const KeyEvent& event) {
       if (deleteConfirmPending) {
         if (event.keyCode == HID_KEY_ENTER && fc > 0) {
           FileInfo* files = getFileList();
-          deleteFile(files[selectedFileIndex].filename);
-          int newFc = getFileCount();
-          if (selectedFileIndex >= newFc) selectedFileIndex = newFc - 1;
-          if (selectedFileIndex < 0) selectedFileIndex = 0;
+          const char* filename = files[selectedFileIndex].filename;
+          git_sync_file_status_t status = git_sync_file_status(filename);
+          if (status == GIT_SYNC_FILE_PUSHED) {
+            deleteFile(filename);
+            int newFc = getFileCount();
+            if (selectedFileIndex >= newFc) selectedFileIndex = newFc - 1;
+            if (selectedFileIndex < 0) selectedFileIndex = 0;
+          } else {
+            const char* message = "Sync this file before deleting";
+            switch (status) {
+              case GIT_SYNC_FILE_NOT_CONFIGURED:
+                message = "Configure Git sync before deleting";
+                break;
+              case GIT_SYNC_FILE_BUSY:
+                message = "Git sync running; deletion blocked";
+                break;
+              case GIT_SYNC_FILE_NOT_PUSHED:
+                message = "Sync this file before deleting";
+                break;
+              case GIT_SYNC_FILE_MODIFIED:
+                message = "Sync edits before deleting";
+                break;
+              case GIT_SYNC_FILE_ERROR:
+                message = "Git check failed; deletion blocked";
+                break;
+              case GIT_SYNC_FILE_PUSHED:
+                break;
+            }
+            strncpy(gitSyncNotice, message, 63);
+            gitSyncNotice[63] = '\0';
+          }
         }
         deleteConfirmPending = false;
         screenDirty = true;

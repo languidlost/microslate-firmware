@@ -1,0 +1,1068 @@
+/* git_sync.cpp -- Draftling's Git synchronisation front-end.
+ *
+ * This file wires the native Git client (git_core.h / git_*.c) to the
+ * editor: it keeps a real commit history under /notes/.git, and on
+ * every sync it
+ *
+ *   1. commits the current working tree ("*.md", "*.fountain" and
+ *      "*.txt" files) locally,
+ *   2. fetches the remote branch over the smart Git HTTP protocol,
+ *   3. fast-forwards or rebases the local commits onto the remote tip,
+ *      running a diff3 line merge and committing any conflicts as-is
+ *      with <<<<<<< / ======= / >>>>>>> markers,
+ *   4. checks the merged tree back out onto the SD card (the editor UI
+ *      then reloads the open buffer), and
+ *   5. pushes the result back to the remote.
+ *
+ * Configuration lives at /git.cfg on the SD card. The editor's working
+ * directory is /notes, so its repository metadata lives in /notes/.git:
+ *
+ *   repo_url=https://github.com/user/repo
+ *   branch=main
+ *   token=ghp_xxx                 (HTTP Basic password)
+ *   username=x-access-token       (optional; HTTP Basic user)
+ *   path=notes/                   (optional remote sub-directory)
+ *   author_name=Jane Doe          (optional)
+ *   author_email=jane@example.com (optional)
+ */
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <ctime>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_netif_sntp.h>
+#include <mbedtls/base64.h>
+#include <WiFi.h>
+
+#include "git_sync.h"
+#include "git_core.h"
+#include <SDCardManager.h>
+
+static const char *TAG = "GitSync";
+
+/* ---- configuration ------------------------------------------------- */
+
+static struct {
+    char repo_url[300];
+    char branch[64];
+    char token[160];
+    char username[64];
+    char remote_path[128];     /* remote sub-directory, no leading '/', trailing '/' */
+    char author_name[64];
+    char author_email[96];
+    char local_path[128];      /* editor documents directory ("/notes") */
+    bool configured;
+} s_cfg;
+
+static git_sync_state_t    s_state    = GIT_SYNC_IDLE;
+static git_sync_callback_t s_callback = NULL;
+static char s_last_error[128] = "";
+static char s_last_sync[32]   = "";
+
+static bool s_time_synced = false;
+
+/* ---- sync task stack (SPIRAM) ------------------------------------- */
+
+#define GIT_SYNC_STACK_SIZE (24 * 1024)
+static StackType_t *s_stack_buf = NULL;
+static StaticTask_t s_task_tcb;
+
+/* ---- helpers ----------------------------------------------------- */
+
+static void set_error(const char *msg)
+{
+    strlcpy(s_last_error, msg, sizeof(s_last_error));
+    s_state = GIT_SYNC_ERROR;
+    if (s_callback) s_callback(GIT_SYNC_ERROR, msg);
+}
+
+static void notify(git_sync_state_t st, const char *msg)
+{
+    s_state = st;
+    if (s_callback) s_callback(st, msg);
+}
+
+/* See the doc comment in include/git_sync.h. The native client streams
+ * blobs through the SD card, so the transient PSRAM peak during a sync
+ * is dominated by a single file plus the LCS merge matrix (~2 MB cap).
+ * Keep the historical 2x factor and 512 KB reserve. */
+extern "C" size_t git_sync_max_file_size(void)
+{
+    const size_t MIN_CAP = 64 * 1024;
+    const size_t RESERVE = 512 * 1024;
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t usable = (free_psram > RESERVE) ? (free_psram - RESERVE) : (free_psram / 2);
+    size_t cap = usable / 2;
+    if (cap < MIN_CAP) cap = MIN_CAP;
+    return cap;
+}
+
+/* ---- best-effort wall-clock ------------------------------------- */
+
+static void ensure_time(void)
+{
+    if (s_time_synced) return;
+    /* Only ever attempt this once per boot -- set the flag up front,
+     * regardless of whether the sync below actually succeeds, so an
+     * unreachable NTP server costs one bounded wait per boot rather
+     * than one on every single git sync.
+     *
+     * There used to be a "skip entirely if time(NULL) already reads a
+     * plausible post-2025 date" shortcut here. That is not the same
+     * thing as "the clock is trustworthy": ESP-IDF's system clock is
+     * backed by the RTC timer domain, which keeps ticking through
+     * deep sleep, so on every wake it already reads whatever the RTC
+     * tracked across the nap -- using the internal RC oscillator on
+     * boards with no external 32kHz crystal, which can drift by
+     * minutes over a long sleep. That drifted value still looks
+     * "plausible" (> 2025-01-01), so the shortcut skipped the actual
+     * correction on every wake, meaning a real SNTP sync effectively
+     * only ever ran once, on the device's very first-ever boot, and
+     * every commit since then used a clock that only ever drifts
+     * further. Attempting SNTP unconditionally on every boot corrects
+     * that drift each time instead of trusting a carried-over guess. */
+    s_time_synced = true;
+
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("2.pool.ntp.org");
+    if (esp_netif_sntp_init(&cfg) == ESP_OK) {
+        if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(6000)) == ESP_OK) {
+            ESP_LOGI(TAG, "SNTP time acquired");
+        } else {
+            ESP_LOGW(TAG, "SNTP sync timed out, using RTC-tracked time");
+        }
+        esp_netif_sntp_deinit();
+    }
+}
+
+static void make_ident(char *out, size_t outsz)
+{
+    time_t now = time(NULL);
+    if (now < 1735689600) now = 1735689600;   /* floor at 2025-01-01 */
+    const char *name  = s_cfg.author_name[0]  ? s_cfg.author_name  : "Draftling";
+    const char *email = s_cfg.author_email[0] ? s_cfg.author_email : "draftling@localhost";
+    snprintf(out, outsz, "%s <%s> %ld +0000", name, email, (long)now);
+}
+
+static void iso_now(char *out, size_t outsz)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    strftime(out, outsz, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+/* ---- working tree <-> flat tree -------------------------------- */
+
+/* A working-tree document: Markdown ("*.md"), a Fountain screenplay
+ * ("*.fountain") or plain text ("*.txt"). Hidden files (the editor's ".<name>.meta" sidecars)
+ * are never synced. */
+static bool has_suffix(const char *name, size_t l, const char *sfx)
+{
+    size_t n = strlen(sfx);
+    return l > n && strcmp(name + l - n, sfx) == 0;
+}
+
+static bool is_doc(const char *name)
+{
+    size_t l = strlen(name);
+    return name[0] != '.' &&
+           (has_suffix(name, l, ".md") || has_suffix(name, l, ".fountain") ||
+            has_suffix(name, l, ".txt"));
+}
+
+/* "<dir>/<name>" without tripping -Wformat-truncation. */
+static void joinp(char *out, size_t osz, const char *dir, const char *name)
+{
+    strlcpy(out, dir, osz);
+    strlcat(out, "/", osz);
+    strlcat(out, name, osz);
+}
+
+/* Build a flat tree object from the document files in the working dir.
+ * Returns the tree oid (zero-cleared when there are no files). */
+static esp_err_t build_worktree_subtree(git_oid *out, int *out_nfiles)
+{
+    git_oid_clear(out);
+    *out_nfiles = 0;
+
+    FsFile dir = SdMan.open(s_cfg.local_path);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return ESP_FAIL;
+    }
+
+    git_tree t = {};
+    esp_err_t ret = ESP_OK;
+    char name[256];
+    for (FsFile entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+        entry.getName(name, sizeof(name));
+        const bool is_directory = entry.isDirectory();
+        entry.close();
+        if (is_directory || !is_doc(name)) continue;
+
+        char path[400];
+        char *data = NULL;
+        size_t len = 0;
+        joinp(path, sizeof(path), s_cfg.local_path, name);
+        if (!git_fs_read_all(path, &data, &len)) { ret = ESP_FAIL; break; }
+
+        git_oid blob;
+        ret = git_odb_write(GIT_OBJ_BLOB, data, len, &blob);
+        free(data);
+        if (ret != ESP_OK) break;
+
+        if (!git_tree_set(&t, 0100644, name, &blob)) { ret = ESP_ERR_NO_MEM; break; }
+        (*out_nfiles)++;
+    }
+    dir.close();
+
+    if (ret == ESP_OK && t.count > 0)
+        ret = git_tree_write(&t, out);
+    git_tree_free(&t);
+    return ret;
+}
+
+/* Materialise a flat tree's blobs into the working dir; delete local
+ * document files not present in the tree. */
+static esp_err_t checkout_subtree(const git_oid *tree_oid, int *out_written)
+{
+    if (out_written) *out_written = 0;
+
+    git_tree t = {};
+    esp_err_t ret = git_oid_is_zero(tree_oid) ? ESP_OK : git_tree_load(tree_oid, &t);
+    if (ret != ESP_OK) return ret;
+
+    for (int i = 0; i < t.count; i++) {
+        const git_tree_entry *e = &t.entries[i];
+        if ((e->mode & 040000) == 040000) continue;    /* skip sub-dirs */
+        if (!is_doc(e->name)) continue;
+
+        git_obj_type ot;
+        git_buf blob = GIT_BUF_INIT;
+        if (git_odb_read(&e->oid, &ot, &blob) != ESP_OK || ot != GIT_OBJ_BLOB) {
+            git_buf_free(&blob);
+            git_tree_free(&t);
+            return ESP_FAIL;
+        }
+        char path[400];
+        joinp(path, sizeof(path), s_cfg.local_path, e->name);
+
+        /* Skip the write if the on-disk content already matches. */
+        char *cur = NULL;
+        size_t curlen = 0;
+        bool same = false;
+        if (git_fs_read_all(path, &cur, &curlen)) {
+            same = (curlen == blob.len) && (memcmp(cur, blob.data, curlen) == 0);
+            free(cur);
+        } else if (git_fs_exists(path)) {
+            git_buf_free(&blob);
+            git_tree_free(&t);
+            return ESP_FAIL;
+        }
+        if (!same) {
+            if (!git_fs_write_all(path, blob.data, blob.len)) {
+                git_buf_free(&blob);
+                git_tree_free(&t);
+                return ESP_FAIL;
+            }
+            if (out_written) (*out_written)++;
+        }
+        git_buf_free(&blob);
+    }
+
+    /* Delete local document files that are gone from the tree. */
+    for (;;) {
+        FsFile dir = SdMan.open(s_cfg.local_path);
+        if (!dir || !dir.isDirectory()) {
+            if (dir) dir.close();
+            git_tree_free(&t);
+            return ESP_FAIL;
+        }
+        char stale_name[256] = "";
+        char name[256];
+        for (FsFile entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+            entry.getName(name, sizeof(name));
+            const bool is_directory = entry.isDirectory();
+            entry.close();
+            if (!is_directory && is_doc(name) && !git_tree_get(&t, name)) {
+                strlcpy(stale_name, name, sizeof(stale_name));
+                break;
+            }
+        }
+        dir.close();
+        if (!stale_name[0]) break;
+
+        char path[400];
+        joinp(path, sizeof(path), s_cfg.local_path, stale_name);
+        if (!git_fs_remove(path)) {
+            git_tree_free(&t);
+            return ESP_FAIL;
+        }
+    }
+
+    git_tree_free(&t);
+    return ESP_OK;
+}
+
+/* Turn merge results into a stored flat tree. */
+static esp_err_t results_to_tree(const git_merge_path_result *res, int n, git_oid *out)
+{
+    git_tree t = {};
+    for (int i = 0; i < n; i++) {
+        if (git_oid_is_zero(&res[i].oid)) continue;      /* deleted */
+        if (!git_tree_set(&t, 0100644, res[i].name, &res[i].oid)) {
+            git_tree_free(&t);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    esp_err_t ret;
+    if (t.count > 0) ret = git_tree_write(&t, out);
+    else { git_oid_clear(out); ret = ESP_OK; }
+    git_tree_free(&t);
+    return ret;
+}
+
+static esp_err_t commit_tree_oid(const git_oid *commit_oid, git_oid *out_tree)
+{
+    if (!commit_oid || git_oid_is_zero(commit_oid)) { git_oid_clear(out_tree); return ESP_OK; }
+    git_commit c;
+    esp_err_t ret = git_commit_load(commit_oid, &c);
+    if (ret != ESP_OK) return ret;
+    *out_tree = c.tree;
+    git_commit_free(&c);
+    return ESP_OK;
+}
+
+/* Subtree oid for the configured remote path within a commit's tree. */
+static esp_err_t subtree_for_commit(const git_oid *commit_oid, git_oid *out)
+{
+    git_oid root;
+    esp_err_t ret = commit_tree_oid(commit_oid, &root);
+    if (ret != ESP_OK) return ret;
+    if (git_oid_is_zero(&root)) { git_oid_clear(out); return ESP_OK; }
+    ret = git_tree_subtree_oid(&root, s_cfg.remote_path, out);
+    if (ret == ESP_ERR_NOT_FOUND) { git_oid_clear(out); return ESP_OK; }
+    return ret;
+}
+
+/* ---- the sync itself ------------------------------------------- */
+
+struct sync_stats {
+    bool committed_local;
+    bool fast_forwarded;
+    bool rebased;
+    bool pushed;
+    int  nconflicts;
+    int  files_out;
+};
+
+static esp_err_t do_sync(git_sync_direction_t dir, sync_stats *st)
+{
+    memset(st, 0, sizeof(*st));
+
+    char localref[96];
+    char remoteref[96];
+    snprintf(localref, sizeof(localref), "refs/heads/%s", s_cfg.branch);
+    snprintf(remoteref, sizeof(remoteref), "refs/remotes/origin/%s", s_cfg.branch);
+    char server_ref[96];
+    snprintf(server_ref, sizeof(server_ref), "refs/heads/%s", s_cfg.branch);
+
+    /* remote descriptor */
+    git_remote remote;
+    memset(&remote, 0, sizeof(remote));
+    {
+        char url[400];
+        strlcpy(url, s_cfg.repo_url, sizeof(url));
+        size_t n = strlen(url);
+        while (n > 1 && url[n - 1] == '/') url[--n] = '\0';
+        if (n < 4 || strcmp(url + n - 4, ".git") != 0)
+            strlcat(url, ".git", sizeof(url));
+        strlcpy(remote.base_url, url, sizeof(remote.base_url));
+
+        if (s_cfg.token[0]) {
+            const char *user = s_cfg.username[0] ? s_cfg.username : "x-access-token";
+            char raw[240];
+            int rl = snprintf(raw, sizeof(raw), "%s:%s", user, s_cfg.token);
+            if (rl > (int)sizeof(raw) - 1) rl = sizeof(raw) - 1;
+            unsigned char b64[340];
+            size_t bl = 0;
+            if (mbedtls_base64_encode(b64, sizeof(b64) - 1, &bl,
+                                      (const unsigned char *)raw, (size_t)rl) == 0) {
+                b64[bl] = '\0';
+                memcpy(remote.auth_basic, "Basic ", 6);
+                strlcpy(remote.auth_basic + 6, (char *)b64, sizeof(remote.auth_basic) - 6);
+            }
+        }
+    }
+
+    if (git_repo_open(s_cfg.local_path) != ESP_OK) {
+        set_error("Cannot create .git on SD card");
+        return ESP_FAIL;
+    }
+    esp_err_t ret = git_head_set_symbolic(localref);
+    if (ret != ESP_OK) { set_error("Cannot set HEAD branch"); return ret; }
+
+    /* 1. advertise remote refs */
+    notify(GIT_SYNC_IN_PROGRESS, "Contacting remote...");
+    git_ref_adv adv[32];
+    int nadv = 0;
+    ret = git_http_list_refs(&remote, "git-upload-pack", adv, 32, &nadv);
+    if (ret == ESP_ERR_INVALID_STATE) { set_error("Auth rejected (check token)"); return ret; }
+    if (ret != ESP_OK) { set_error("Cannot reach remote repository"); return ret; }
+
+    git_oid remote_sha;
+    bool remote_has_branch = false;
+    for (int i = 0; i < nadv; i++) {
+        if (strcmp(adv[i].name, server_ref) == 0) {
+            remote_sha = adv[i].oid;
+            remote_has_branch = true;
+            break;
+        }
+    }
+
+    /* git_ref_read() leaves *out untouched on failure (ref file does
+     * not exist yet -- the very first sync of a repo), so local_head
+     * must start zeroed: step 5 below reads it unconditionally
+     * (subtree_for_commit(&local_head, ...)), regardless of whether
+     * have_head is true, and an uninitialized oid there would compare
+     * as some garbage non-zero SHA instead of "no commit". */
+    git_oid local_head;
+    git_oid_clear(&local_head);
+    bool have_head = (git_ref_read(localref, &local_head) == ESP_OK) &&
+                     !git_oid_is_zero(&local_head);
+    bool initial_clone = false;
+
+    /* 2. initial clone */
+    if (!have_head && remote_has_branch) {
+        notify(GIT_SYNC_IN_PROGRESS, "Cloning history...");
+        char pack[160];
+        snprintf(pack, sizeof(pack), "%s/tmp/fetch.pack", git_repo_gitdir());
+        ret = git_http_fetch_pack(&remote, &remote_sha, 1, NULL, 0, pack);
+        if (ret != ESP_OK) { set_error("Fetch failed"); return ret; }
+        ret = git_pack_unpack_file(pack);
+        git_fs_remove(pack);
+        if (ret != ESP_OK) { set_error("Cannot unpack fetched history"); return ret; }
+
+        ret = git_ref_write(localref, &remote_sha);
+        if (ret != ESP_OK) { set_error("Cannot create local branch"); return ret; }
+        ret = git_ref_write(remoteref, &remote_sha);
+        if (ret != ESP_OK) { set_error("Cannot record remote branch"); return ret; }
+        local_head = remote_sha;
+        have_head = true;
+        initial_clone = true;
+    }
+
+    /* 3. local commit from the working tree */
+    notify(GIT_SYNC_IN_PROGRESS, "Committing local changes...");
+    ensure_time();
+
+    git_oid ours_sub;
+    int nfiles = 0;
+    ret = build_worktree_subtree(&ours_sub, &nfiles);
+    if (ret != ESP_OK) { set_error("Cannot read working tree"); return ret; }
+
+    git_oid cur_sub;
+    ret = subtree_for_commit(have_head ? &local_head : NULL, &cur_sub);
+    if (ret != ESP_OK) { set_error("Cannot read current tree"); return ret; }
+
+    if (!git_oid_eq(&ours_sub, &cur_sub)) {
+        git_oid commit_sub = ours_sub;
+        if (initial_clone) {
+            git_oid empty;
+            git_oid_clear(&empty);
+            git_merge_path_result *paths = NULL;
+            int npaths = 0;
+            int conflicts = 0;
+            ret = git_merge_trees_flat(&empty, &cur_sub, &ours_sub,
+                                       "ours (remote)", "theirs (local)",
+                                       &paths, &npaths, &conflicts);
+            if (ret != ESP_OK) {
+                set_error("Cannot merge local files with the cloned repository");
+                return ret;
+            }
+            ret = results_to_tree(paths, npaths, &commit_sub);
+            free(paths);
+            if (ret != ESP_OK) { set_error("Cannot store initial merge"); return ret; }
+            st->nconflicts += conflicts;
+        }
+
+        if (!git_oid_eq(&commit_sub, &cur_sub)) {
+            git_oid base_root;
+            ret = commit_tree_oid(have_head ? &local_head : NULL, &base_root);
+            if (ret != ESP_OK) { set_error("Cannot read current repository tree"); return ret; }
+            git_oid new_root;
+            ret = git_tree_splice_subtree(git_oid_is_zero(&base_root) ? NULL : &base_root,
+                                          s_cfg.remote_path, &commit_sub, &new_root);
+            if (ret != ESP_OK) { set_error("Cannot build commit tree"); return ret; }
+
+            char ident[224], iso[32], msg[256];
+            make_ident(ident, sizeof(ident));
+            iso_now(iso, sizeof(iso));
+            if (st->nconflicts)
+                snprintf(msg, sizeof(msg), "Draftling sync: %d file(s) at %s\n\n[draftling] %d conflict(s) committed with markers",
+                         nfiles, iso, st->nconflicts);
+            else
+                snprintf(msg, sizeof(msg), "Draftling sync: %d file(s) at %s", nfiles, iso);
+
+            git_oid parents[1];
+            int np = 0;
+            if (have_head) { parents[0] = local_head; np = 1; }
+
+            git_oid newc;
+            ret = git_commit_create(&new_root, parents, np, ident, msg, &newc);
+            if (ret != ESP_OK) { set_error("Cannot create local commit"); return ret; }
+
+            ret = git_ref_write(localref, &newc);
+            if (ret != ESP_OK) { set_error("Cannot update local branch"); return ret; }
+            local_head = newc;
+            have_head = true;
+            st->committed_local = true;
+            ESP_LOGI(TAG, "local commit %s", newc.hex);
+        }
+    }
+
+    /* 4. integrate remote */
+    bool need_integrate = remote_has_branch &&
+                          !git_oid_eq(&remote_sha, &local_head) &&
+                          !git_is_ancestor(&remote_sha, &local_head);
+
+    if (need_integrate) {
+        if (!git_odb_exists(&remote_sha)) {
+            notify(GIT_SYNC_IN_PROGRESS, "Fetching remote commits...");
+            git_oid haves[16];
+            int nh = 0;
+            git_oid *chain = NULL;
+            int nchain = 0;
+            if (git_commit_list_linear(NULL, &local_head, &chain, &nchain) == ESP_OK) {
+                for (int i = nchain - 1; i >= 0 && nh < 16; i--) haves[nh++] = chain[i];
+                free(chain);
+            }
+            char pack[160];
+            snprintf(pack, sizeof(pack), "%s/tmp/fetch.pack", git_repo_gitdir());
+            ret = git_http_fetch_pack(&remote, &remote_sha, 1, haves, nh, pack);
+            if (ret != ESP_OK) { set_error("Fetch failed"); return ret; }
+            ret = git_pack_unpack_file(pack);
+            git_fs_remove(pack);
+            if (ret != ESP_OK) { set_error("Cannot unpack remote commits"); return ret; }
+        }
+
+        git_oid mb;
+        git_merge_base(&local_head, &remote_sha, &mb);
+
+        if (git_oid_eq(&mb, &remote_sha)) {
+            /* remote tip is already an ancestor -- we are ahead, nothing
+             * to integrate; the push below fast-forwards the remote. */
+            ESP_LOGI(TAG, "local ahead of remote, no integrate needed");
+        } else if (git_oid_eq(&mb, &local_head)) {
+            /* fast-forward */
+            local_head = remote_sha;
+            ret = git_ref_write(localref, &local_head);
+            if (ret != ESP_OK) { set_error("Cannot fast-forward local branch"); return ret; }
+            ret = git_ref_write(remoteref, &remote_sha);
+            if (ret != ESP_OK) { set_error("Cannot record remote branch"); return ret; }
+            st->fast_forwarded = true;
+            ESP_LOGI(TAG, "fast-forward to %s", remote_sha.hex);
+        } else {
+            notify(GIT_SYNC_IN_PROGRESS, "Rebasing local commits...");
+            git_oid *commits = NULL;
+            int ncommits = 0;
+            const git_oid *mbp = git_oid_is_zero(&mb) ? NULL : &mb;
+            ret = git_commit_list_linear(mbp, &local_head, &commits, &ncommits);
+            if (ret != ESP_OK) { set_error("History not linear -- cannot rebase"); return ret; }
+
+            git_oid newbase = remote_sha;
+            char ident[224];
+            make_ident(ident, sizeof(ident));
+
+            for (int i = 0; i < ncommits; i++) {
+                git_commit cc;
+                if (git_commit_load(&commits[i], &cc) != ESP_OK) { ret = ESP_FAIL; break; }
+                git_oid cparent = (cc.nparents > 0) ? cc.parents[0] : (git_oid){0};
+
+                git_oid base_sub, ours_sub2, theirs_sub;
+                subtree_for_commit(git_oid_is_zero(&cparent) ? NULL : &cparent, &base_sub);
+                subtree_for_commit(&newbase, &ours_sub2);
+                subtree_for_commit(&commits[i], &theirs_sub);
+
+                git_merge_path_result *res = NULL;
+                int nres = 0, nconf = 0;
+                ret = git_merge_trees_flat(&base_sub, &ours_sub2, &theirs_sub,
+                                           "ours (remote)", "theirs (local)",
+                                           &res, &nres, &nconf);
+                if (ret != ESP_OK) { git_commit_free(&cc); break; }
+
+                git_oid merged_sub;
+                ret = results_to_tree(res, nres, &merged_sub);
+                free(res);
+                if (ret != ESP_OK) { git_commit_free(&cc); break; }
+
+                git_oid nb_root;
+                commit_tree_oid(&newbase, &nb_root);
+                git_oid new_root;
+                ret = git_tree_splice_subtree(git_oid_is_zero(&nb_root) ? NULL : &nb_root,
+                                              s_cfg.remote_path, &merged_sub, &new_root);
+                if (ret != ESP_OK) { git_commit_free(&cc); break; }
+
+                char msg[256];
+                if (nconf)
+                    snprintf(msg, sizeof(msg), "%s\n\n[draftling] %d conflict(s) committed with markers",
+                             cc.message ? cc.message : "Draftling sync", nconf);
+                else
+                    snprintf(msg, sizeof(msg), "%s", cc.message ? cc.message : "Draftling sync");
+                git_commit_free(&cc);
+
+                git_oid parents[1] = { newbase };
+                git_oid newc;
+                ret = git_commit_create(&new_root, parents, 1, ident, msg, &newc);
+                if (ret != ESP_OK) break;
+                newbase = newc;
+                st->nconflicts += nconf;
+            }
+            free(commits);
+            if (ret != ESP_OK) { set_error("Rebase failed"); return ret; }
+
+            local_head = newbase;
+            ret = git_ref_write(localref, &local_head);
+            if (ret != ESP_OK) { set_error("Cannot update local branch after rebase"); return ret; }
+            ret = git_ref_write(remoteref, &remote_sha);
+            if (ret != ESP_OK) { set_error("Cannot record remote branch"); return ret; }
+            st->rebased = true;
+        }
+    } else if (remote_has_branch && git_oid_eq(&remote_sha, &local_head)) {
+        git_ref_write(remoteref, &remote_sha);
+    }
+
+    /* 5. checkout the integrated tree */
+    {
+        git_oid sub;
+        ret = subtree_for_commit(&local_head, &sub);
+        if (ret != ESP_OK) { set_error("Cannot read integrated tree"); return ret; }
+        notify(GIT_SYNC_IN_PROGRESS, "Updating working files...");
+        ret = checkout_subtree(&sub, &st->files_out);
+        if (ret != ESP_OK) { set_error("Cannot update working files"); return ret; }
+    }
+
+    /* 6. push */
+    bool want_push = (dir != GIT_SYNC_PULL);
+    bool have_remote_target = (s_cfg.repo_url[0] != '\0');
+
+    /* What the push would be layered on top of: the remote's current
+     * tip, or the zero oid if the branch does not exist there yet (a
+     * brand-new / empty remote repo) -- git's smart-HTTP protocol
+     * represents "create this ref" with an all-zero old-oid. Comparing
+     * against &local_head itself in that case (as this used to) is
+     * trivially always "equal" and silently skips every push to an
+     * empty remote, no matter what is committed locally. */
+    git_oid remote_baseline;
+    if (remote_has_branch) remote_baseline = remote_sha;
+    else git_oid_clear(&remote_baseline);
+
+    if (want_push && have_remote_target && !git_oid_eq(&local_head, &remote_baseline)) {
+
+        if (remote_has_branch && !git_is_ancestor(&remote_sha, &local_head)) {
+            set_error("Push blocked: remote advanced during sync -- retry");
+            return ESP_FAIL;
+        }
+
+        notify(GIT_SYNC_IN_PROGRESS, "Pushing to remote...");
+        git_oidset set = {};
+        git_oid haves[1];
+        int nh = 0;
+        if (remote_has_branch) haves[nh++] = remote_sha;
+
+        ret = git_reachable_objects(&local_head, 1, haves, nh, &set);
+        if (ret != ESP_OK) { git_oidset_free(&set); set_error("Cannot enumerate objects"); return ret; }
+
+        char pack[160];
+        snprintf(pack, sizeof(pack), "%s/tmp/push.pack", git_repo_gitdir());
+        ret = git_pack_write_file(pack, &set);
+        git_oidset_free(&set);
+        if (ret != ESP_OK) { git_fs_remove(pack); set_error("Cannot build packfile"); return ret; }
+
+        git_buf report = GIT_BUF_INIT;
+        ret = git_http_push(&remote, server_ref, &remote_baseline, &local_head, pack, &report);
+        git_fs_remove(pack);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "push report: %.*s", (int)report.len, (char *)report.data);
+            git_buf_free(&report);
+            set_error("Remote rejected the push");
+            return ret;
+        }
+        git_buf_free(&report);
+
+        git_ref_write(remoteref, &local_head);
+        st->pushed = true;
+        ESP_LOGI(TAG, "pushed %s", local_head.hex);
+    }
+
+    return ESP_OK;
+}
+
+/* ---- task ------------------------------------------------------- */
+
+static void sync_task(void *arg)
+{
+    git_sync_direction_t dir = (git_sync_direction_t)(intptr_t)arg;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        set_error("WiFi not connected");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sync_stats st;
+    esp_err_t ret = do_sync(dir, &st);
+
+    git_repo_close();
+
+    if (ret == ESP_OK) {
+        char summary[128];
+        size_t pos = 0;
+        pos += snprintf(summary + pos, sizeof(summary) - pos,
+                        st.nconflicts ? "Sync done, %d conflict(s)" : "Sync complete",
+                        st.nconflicts);
+        const char *parts[5];
+        int np = 0;
+        char b1[24], b2[24];
+        if (st.committed_local) parts[np++] = "committed";
+        if (st.fast_forwarded)  parts[np++] = "fast-forward";
+        if (st.rebased)         parts[np++] = "rebased";
+        if (st.files_out) { snprintf(b1, sizeof(b1), "%d file(s) updated", st.files_out); parts[np++] = b1; }
+        if (st.pushed) { snprintf(b2, sizeof(b2), "pushed"); parts[np++] = b2; }
+        if (np) {
+            pos += snprintf(summary + pos, sizeof(summary) - pos, " (");
+            for (int i = 0; i < np && pos < sizeof(summary); i++)
+                pos += snprintf(summary + pos, sizeof(summary) - pos, "%s%s",
+                                i ? ", " : "", parts[i]);
+            snprintf(summary + pos, sizeof(summary) - pos, ")");
+        }
+        strlcpy(s_last_sync, "OK", sizeof(s_last_sync));
+        notify(GIT_SYNC_SUCCESS, summary);
+    } else if (s_state != GIT_SYNC_ERROR) {
+        set_error("Sync failed");
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* ---- config --------------------------------------------------- */
+
+static void trim(char *s)
+{
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ' || s[n - 1] == '\t'))
+        s[--n] = '\0';
+}
+
+static void parse_config(const char *data)
+{
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    strlcpy(s_cfg.branch, "main", sizeof(s_cfg.branch));
+    strlcpy(s_cfg.local_path, "/notes", sizeof(s_cfg.local_path));
+
+    const char *p = data;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        char line[400];
+        if (linelen >= sizeof(line)) linelen = sizeof(line) - 1;
+        memcpy(line, p, linelen);
+        line[linelen] = '\0';
+        p = nl ? nl + 1 : p + strlen(p);
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        trim(key);
+        trim(val);
+
+        if (!strcmp(key, "repo_url"))          strlcpy(s_cfg.repo_url, val, sizeof(s_cfg.repo_url));
+        else if (!strcmp(key, "branch"))       strlcpy(s_cfg.branch, val, sizeof(s_cfg.branch));
+        else if (!strcmp(key, "token"))        strlcpy(s_cfg.token, val, sizeof(s_cfg.token));
+        else if (!strcmp(key, "username"))     strlcpy(s_cfg.username, val, sizeof(s_cfg.username));
+        else if (!strcmp(key, "author_name"))  strlcpy(s_cfg.author_name, val, sizeof(s_cfg.author_name));
+        else if (!strcmp(key, "author_email")) strlcpy(s_cfg.author_email, val, sizeof(s_cfg.author_email));
+        else if (!strcmp(key, "path")) {
+            strlcpy(s_cfg.remote_path, val, sizeof(s_cfg.remote_path));
+            /* normalise: no leading '/', exactly one trailing '/' */
+            char *q = s_cfg.remote_path;
+            while (*q == '/') memmove(q, q + 1, strlen(q));
+            size_t n = strlen(s_cfg.remote_path);
+            while (n && s_cfg.remote_path[n - 1] == '/') s_cfg.remote_path[--n] = '\0';
+            if (n && n + 1 < sizeof(s_cfg.remote_path)) {
+                s_cfg.remote_path[n] = '/';
+                s_cfg.remote_path[n + 1] = '\0';
+            }
+        }
+    }
+
+    s_cfg.configured = (s_cfg.repo_url[0] != '\0' && s_cfg.token[0] != '\0');
+    if (s_cfg.branch[0] == '\0') strlcpy(s_cfg.branch, "main", sizeof(s_cfg.branch));
+}
+
+/* ---- public API --------------------------------------------- */
+
+extern "C" esp_err_t git_sync_init(void)
+{
+    char *data = NULL;
+    size_t len = 0;
+    if (git_fs_read_all("/git.cfg", &data, &len)) {
+        parse_config(data);
+        free(data);
+        if (s_cfg.configured)
+            ESP_LOGI(TAG, "Git configured: %s branch=%s path=%s",
+                     s_cfg.repo_url, s_cfg.branch,
+                     s_cfg.remote_path[0] ? s_cfg.remote_path : "(root)");
+    } else {
+        parse_config("");
+        ESP_LOGI(TAG, "No /git.cfg -- sync disabled");
+    }
+    return ESP_OK;
+}
+
+/* ---- Draftbox --------------------------------------------- */
+
+/* Set while git_sync_draftbox_connect() runs (on a worker task), so a
+ * sync cannot start with a configuration that is being replaced. */
+#if 0
+static volatile bool s_draftbox_busy = false;
+
+/* Keys that describe the remote repository. Connecting to a Draftbox
+ * repository replaces all of them with what the server returned:
+ * repo_url, token, username and branch (when sent). path is dropped --
+ * a sub-directory chosen for the previous repository would not exist
+ * on the new one -- so the whole repository is synced. */
+static bool is_repo_key(const char *line)
+{
+    static const char *const keys[] = { "repo_url", "token", "username", "branch", "path" };
+    while (*line == ' ' || *line == '\t') line++;
+    for (const char *k : keys) {
+        size_t n = strlen(k);
+        if (strncmp(line, k, n) != 0) continue;
+        const char *p = line + n;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '=') return true;
+    }
+    return false;
+}
+
+/* Normalise the user's site entry into a bare "host[:port][/prefix]". */
+static bool normalise_site(const char *in, char *out, size_t out_sz)
+{
+    while (*in == ' ' || *in == '\t') in++;
+    if (!strncasecmp(in, "https://", 8)) in += 8;
+    else if (!strncasecmp(in, "http://", 7)) in += 7;
+    strlcpy(out, in, out_sz);
+    size_t n = strlen(out);
+    while (n && (out[n - 1] == '/' || out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+    if (n == 0 || out[0] == '/') return false;
+    for (const char *p = out; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '?' || c == '#' || c == '@')
+            return false;
+    }
+    return true;
+}
+
+static esp_err_t draftbox_connect(const char *site, const char *otp,
+                                  char *msg, size_t msg_len)
+{
+    char host[128];
+    if (!normalise_site(site ? site : "", host, sizeof(host))) {
+        snprintf(msg, msg_len, "invalid site name");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char pw[9];
+    size_t n = 0;
+    for (const char *p = otp ? otp : ""; *p; p++) {
+        if (*p == ' ' || *p == '-') continue;
+        if (*p < '0' || *p > '9' || n >= 8) { n = 0; break; }
+        pw[n++] = *p;
+    }
+    if (n != 8) {
+        snprintf(msg, msg_len, "password must be 8 digits");
+        return ESP_ERR_INVALID_ARG;
+    }
+    pw[8] = '\0';
+
+    if (!wifi_manager_is_connected()) {
+        snprintf(msg, msg_len, "connect WiFi first");
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* The password works only once: make sure the result can be stored
+     * before spending it. */
+    if (!sd_card_is_ready()) {
+        snprintf(msg, msg_len, "no SD card");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    draftbox_result_t *res = (draftbox_result_t *)calloc(1, sizeof(*res));
+    if (!res) {
+        snprintf(msg, msg_len, "out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = draftbox_token_exchange(host, pw, res);
+    if (err != ESP_OK) {
+        snprintf(msg, msg_len, "%s", res->error);
+        free(res);
+        return err;
+    }
+
+    /* Keep every line of the old git.cfg that does not describe the
+     * remote repository (author_name, author_email, comments...). */
+    std::string cfg;
+    char *old = NULL;
+    size_t old_len = 0;
+    if (sd_card_read_file("/sdcard/git.cfg", &old, &old_len) == ESP_OK && old) {
+        const char *p = old;
+        const char *end = old + old_len;
+        while (p < end) {
+            const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+            size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+            std::string line(p, len);
+            p += len + (nl ? 1 : 0);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || is_repo_key(line.c_str())) continue;
+            cfg += line;
+            cfg += '\n';
+        }
+    }
+    free(old);
+    cfg += "repo_url=";
+    cfg += res->clone_url;
+    cfg += "\ntoken=";
+    cfg += res->token;
+    cfg += '\n';
+    if (res->user[0]) {
+        cfg += "username=";
+        cfg += res->user;
+        cfg += '\n';
+    }
+    if (res->branch[0]) {
+        cfg += "branch=";
+        cfg += res->branch;
+        cfg += '\n';
+    }
+
+    err = sd_card_write_file("/sdcard/git.cfg", cfg.data(), cfg.size());
+    if (err != ESP_OK) {
+        snprintf(msg, msg_len, "cannot write git.cfg");
+    } else {
+        /* The remote-tracking ref describes what is on the *previous*
+         * server; git_sync_file_status() must not take it as proof that
+         * a file is stored on the new one. The next sync recreates it. */
+        if (s_cfg.repo_url[0] && strcmp(s_cfg.repo_url, res->clone_url) != 0) {
+            char refpath[400];
+            snprintf(refpath, sizeof(refpath), "%s/.git/refs/remotes/origin/%s",
+                     s_cfg.local_path, s_cfg.branch);
+            if (sd_card_file_exists(refpath)) sd_card_delete_file(refpath);
+        }
+        parse_config(cfg.c_str());
+        ESP_LOGI(TAG, "Draftbox: git.cfg now points at %s", s_cfg.repo_url);
+        snprintf(msg, msg_len, "connected to %.80s%s",
+                 res->repository[0] ? res->repository : res->clone_url,
+                 res->read_only ? " (read-only)" : "");
+    }
+    /* Do not leave the secret lying around in freed heap. */
+    memset(res->token, 0, sizeof(res->token));
+    std::fill(cfg.begin(), cfg.end(), '\0');
+    free(res);
+    return err;
+}
+
+extern "C" esp_err_t git_sync_draftbox_connect(const char *site, const char *otp,
+                                               char *msg, size_t msg_len)
+{
+    if (s_state == GIT_SYNC_IN_PROGRESS || s_draftbox_busy) {
+        snprintf(msg, msg_len, "sync in progress, try later");
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_draftbox_busy = true;
+    esp_err_t err = draftbox_connect(site, otp, msg, msg_len);
+    s_draftbox_busy = false;
+    return err;
+}
+#endif
+
+extern "C" esp_err_t git_sync_start(git_sync_direction_t direction)
+{
+    if (!s_cfg.configured) { set_error("Not configured"); return ESP_ERR_INVALID_STATE; }
+    if (s_state == GIT_SYNC_IN_PROGRESS) { set_error("Sync already in progress"); return ESP_ERR_INVALID_STATE; }
+
+    s_state = GIT_SYNC_IN_PROGRESS;
+
+    if (!s_stack_buf) {
+        s_stack_buf = (StackType_t *)heap_caps_malloc(GIT_SYNC_STACK_SIZE, MALLOC_CAP_SPIRAM);
+        if (!s_stack_buf) { set_error("Failed to alloc sync stack"); return ESP_ERR_NO_MEM; }
+    }
+
+    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
+        sync_task, "git_sync", GIT_SYNC_STACK_SIZE / sizeof(StackType_t),
+        (void *)(intptr_t)direction, 3, s_stack_buf, &s_task_tcb, 0);
+    if (!h) { set_error("Failed to start sync task"); return ESP_FAIL; }
+    return ESP_OK;
+}
+
+extern "C" git_sync_file_status_t git_sync_file_status(const char *name)
+{
+    if (!s_cfg.configured) return GIT_SYNC_FILE_NOT_CONFIGURED;
+    /* The sync task owns the repository while it runs, and it can
+     * rewrite both the file and the refs. Both this check and
+     * git_sync_start() run on the UI task, so the state cannot change
+     * under us. */
+    if (s_state == GIT_SYNC_IN_PROGRESS) return GIT_SYNC_FILE_BUSY;
+    if (!name || !*name || strchr(name, '/') || !is_doc(name)) return GIT_SYNC_FILE_NOT_PUSHED;
+
+    /* Look for the remote-tracking ref first: git_repo_open() would
+     * create an empty repository on a card that was never synced. */
+    char remoteref[96];
+    snprintf(remoteref, sizeof(remoteref), "refs/remotes/origin/%s", s_cfg.branch);
+    char refpath[400];
+    snprintf(refpath, sizeof(refpath), "%s/.git/%s", s_cfg.local_path, remoteref);
+    if (!git_fs_exists(refpath)) return GIT_SYNC_FILE_NOT_PUSHED;
+
+    char path[400];
+    joinp(path, sizeof(path), s_cfg.local_path, name);
+    char *data = NULL;
+    size_t len = 0;
+    if (!git_fs_read_all(path, &data, &len)) return GIT_SYNC_FILE_ERROR;
+    git_oid work_blob;
+    git_odb_hash(GIT_OBJ_BLOB, data, len, &work_blob);
+    free(data);
+
+    if (git_repo_open(s_cfg.local_path) != ESP_OK) return GIT_SYNC_FILE_ERROR;
+    git_sync_file_status_t result = GIT_SYNC_FILE_ERROR;
+    git_oid pushed, sub;
+    if (git_ref_read(remoteref, &pushed) != ESP_OK) {
+        result = GIT_SYNC_FILE_NOT_PUSHED;
+    } else if (subtree_for_commit(&pushed, &sub) == ESP_OK) {
+        if (git_oid_is_zero(&sub)) {
+            result = GIT_SYNC_FILE_NOT_PUSHED;
+        } else {
+            git_tree t = {};
+            if (git_tree_load(&sub, &t) == ESP_OK) {
+                const git_tree_entry *e = git_tree_get(&t, name);
+                if (!e)                              result = GIT_SYNC_FILE_NOT_PUSHED;
+                else if (git_oid_eq(&e->oid, &work_blob)) result = GIT_SYNC_FILE_PUSHED;
+                else                                 result = GIT_SYNC_FILE_MODIFIED;
+                git_tree_free(&t);
+            }
+        }
+    }
+    git_repo_close();
+    ESP_LOGI(TAG, "file status %s: %d", name, (int)result);
+    return result;
+}
+
+extern "C" git_sync_state_t git_sync_get_state(void) { return s_state; }
+extern "C" void git_sync_set_callback(git_sync_callback_t cb) { s_callback = cb; }
+extern "C" bool git_sync_is_configured(void) { return s_cfg.configured; }
+extern "C" const char *git_sync_get_last_error(void) { return s_last_error; }
+extern "C" const char *git_sync_get_last_sync_time(void) { return s_last_sync; }

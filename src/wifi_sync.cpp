@@ -2,19 +2,18 @@
 #include "config.h"
 #include "file_manager.h"
 #include "sd_backup.h"
+#include "git_sync.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
 #include <SDCardManager.h>
 #include <Preferences.h>
 
 // --- Internal state ---
-static WebServer* server = nullptr;
 static bool syncActive = false;
 static SyncState syncState = SyncState::SCANNING;
 static char statusText[64] = "";
+extern UIState currentState;
 
 extern bool screenDirty;
 
@@ -50,63 +49,21 @@ static char connectingSSID[33] = "";
 static bool usedSavedPassword = false;
 static bool autoConnectAttempted = false;  // True if we tried auto-connect with saved creds
 
-// --- Sync activity tracking ---
-static int filesSent = 0;       // Files downloaded by PC (GET)
-static int filesReceived = 0;  // Files uploaded by PC (POST)
-static int totalFilesToSync = 0; // Total .txt files on device
-
-static constexpr int MAX_LOG_LINES = 6;
-static char syncLog[MAX_LOG_LINES][48];
-static int syncLogCount = 0;
-
-static bool pcConnected = false;
-
-static unsigned long lastHttpActivityMs = 0;
-static constexpr unsigned long SYNC_TIMEOUT_MS = 60000;  // 60s no HTTP → auto-disconnect
-static bool syncCompletePending = false;  // Set by handler, acted on in wifiSyncLoop
+static bool gitJobStarted = false;
+static bool gitSyncSucceeded = false;
+static bool returnToEditor = false;
+static bool wifiPrefsOpen = false;
+static char editorFileToReload[MAX_FILENAME_LEN] = "";
 
 // --- DONE state ---
 static unsigned long doneStartMs = 0;
 static constexpr unsigned long DONE_DISPLAY_MS = 3000;  // 3s before returning to menu
 
 // --- Forward declarations ---
-static void startHttpServer();
-static void stopHttpServer();
 static void beginScan();
 static void beginConnect(const char* ssid, const char* pass);
 static void enterSyncingState();
 static void enterDoneState();
-static void addSyncLogEntry(const char* fmt, const char* filename);
-
-// =========================================================================
-// Sync log helpers
-// =========================================================================
-
-static void resetSyncTracking() {
-  filesSent = 0;
-  filesReceived = 0;
-  totalFilesToSync = getFileCount();
-  syncLogCount = 0;
-  syncCompletePending = false;
-  pcConnected = false;
-  for (int i = 0; i < MAX_LOG_LINES; i++) syncLog[i][0] = '\0';
-}
-
-int getSyncTotalFiles() { return totalFilesToSync; }
-
-static void addSyncLogEntry(const char* fmt, const char* filename) {
-  // Shift entries up if full
-  if (syncLogCount >= MAX_LOG_LINES) {
-    for (int i = 0; i < MAX_LOG_LINES - 1; i++) {
-      strncpy(syncLog[i], syncLog[i + 1], sizeof(syncLog[i]) - 1);
-      syncLog[i][sizeof(syncLog[i]) - 1] = '\0';
-    }
-    syncLogCount = MAX_LOG_LINES - 1;
-  }
-  snprintf(syncLog[syncLogCount], sizeof(syncLog[syncLogCount]), fmt, filename);
-  syncLogCount++;
-  screenDirty = true;
-}
 
 // =========================================================================
 // SD card backup for WiFi credentials
@@ -372,32 +329,36 @@ static void beginConnect(const char* ssid, const char* pass) {
 }
 
 static void enterSyncingState() {
-  resetSyncTracking();
-  startHttpServer();
+  gitJobStarted = true;
+  git_sync_set_callback([](git_sync_state_t, const char* message) {
+    strncpy(statusText, message ? message : "", sizeof(statusText) - 1);
+    statusText[sizeof(statusText) - 1] = '\0';
+    screenDirty = true;
+  });
   snprintf(statusText, sizeof(statusText), "%s",
            WiFi.localIP().toString().c_str());
   syncState = SyncState::SYNCING;
-  lastHttpActivityMs = millis();
   screenDirty = true;
-  DBG_PRINTF("[SYNC] Syncing — server at %s\n", statusText);
+  if (git_sync_start(GIT_SYNC_BOTH) != ESP_OK) {
+    const char* error = git_sync_get_last_error();
+    strncpy(statusText, error && error[0] ? error : "Could not start Git sync",
+            sizeof(statusText) - 1);
+    statusText[sizeof(statusText) - 1] = '\0';
+  }
+  screenDirty = true;
+  DBG_PRINTF("[GIT] Sync started on %s\n", statusText);
 }
 
 static void enterDoneState() {
-  stopHttpServer();
+  gitSyncSucceeded = git_sync_get_state() == GIT_SYNC_SUCCESS;
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
   syncState = SyncState::DONE;
   doneStartMs = millis();
 
-  if (filesSent == 0 && filesReceived == 0) {
-    strcpy(statusText, "No changes");
-  } else {
-    snprintf(statusText, sizeof(statusText), "Sent: %d  Received: %d",
-             filesSent, filesReceived);
-  }
   screenDirty = true;
-  DBG_PRINTF("[SYNC] Done — %s\n", statusText);
+  DBG_PRINTF("[GIT] Done — %s\n", statusText);
 }
 
 static void pollConnection() {
@@ -427,126 +388,6 @@ static void pollConnection() {
     screenDirty = true;
     DBG_PRINTLN("[SYNC] Connection timed out");
   }
-}
-
-// =========================================================================
-// HTTP Server
-// =========================================================================
-
-static void handleFileList() {
-  lastHttpActivityMs = millis();
-  if (!pcConnected) {
-    pcConnected = true;
-    screenDirty = true;
-  }
-
-  auto dir = SdMan.open("/notes");
-  if (!dir || !dir.isDirectory()) {
-    if (dir) dir.close();
-    server->send(500, "application/json", "[]");
-    return;
-  }
-
-  String json = "[";
-  bool first = true;
-  char name[256];
-
-  dir.rewindDirectory();
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    file.getName(name, sizeof(name));
-    if (name[0] == '.') { file.close(); continue; }
-
-    int nameLen = strlen(name);
-    if (nameLen > 4 && strcmp(name + nameLen - 4, ".txt") == 0) {
-      if (!first) json += ",";
-      first = false;
-      json += "{\"name\":\"";
-      json += name;
-      json += "\",\"size\":";
-      json += String((unsigned long)file.size());
-      json += "}";
-    }
-    file.close();
-  }
-  dir.close();
-
-  json += "]";
-  server->send(200, "application/json", json);
-}
-
-static void handleFileDownload() {
-  lastHttpActivityMs = millis();
-
-  String uri = server->uri();
-  if (!uri.startsWith("/notes/") || uri.length() <= 7) {
-    server->send(400, "text/plain", "Bad request");
-    return;
-  }
-
-  String filename = uri.substring(7);
-  char path[320];
-  snprintf(path, sizeof(path), "/notes/%s", filename.c_str());
-
-  auto file = SdMan.open(path, O_RDONLY);
-  if (!file) {
-    server->send(404, "text/plain", "Not found");
-    return;
-  }
-
-  size_t fileSize = file.size();
-  server->setContentLength(fileSize);
-  server->send(200, "text/plain", "");
-
-  uint8_t buf[512];
-  while (file.available()) {
-    int bytesRead = file.read(buf, sizeof(buf));
-    if (bytesRead <= 0) break;
-    server->client().write(buf, bytesRead);
-  }
-  file.close();
-
-  // Track: PC downloaded a file from device = "sent"
-  filesSent++;
-  screenDirty = true;
-  DBG_PRINTF("[SYNC] Sent file: %s\n", filename.c_str());
-}
-
-static void handleSyncComplete() {
-  lastHttpActivityMs = millis();
-  server->send(200, "text/plain", "OK");
-  DBG_PRINTLN("[SYNC] PC signaled sync complete");
-  syncCompletePending = true;  // enterDoneState() called from wifiSyncLoop, not here
-}
-
-static void handleNotFound() {
-  String uri = server->uri();
-
-  if (uri.startsWith("/notes/") && uri.length() > 7 && server->method() == HTTP_GET) {
-    handleFileDownload();
-    return;
-  }
-
-  server->send(404, "text/plain", "Not found");
-}
-
-static void startHttpServer() {
-  if (server) return;
-  server = new WebServer(80);
-  server->on("/api/files", HTTP_GET, handleFileList);
-  server->on("/api/sync-complete", HTTP_POST, handleSyncComplete);
-  server->onNotFound(handleNotFound);
-  server->begin();
-  MDNS.begin("microslate");
-  DBG_PRINTF("[SYNC] HTTP server started at %s\n", WiFi.localIP().toString().c_str());
-}
-
-static void stopHttpServer() {
-  if (server) {
-    server->stop();
-    delete server;
-    server = nullptr;
-  }
-  MDNS.end();
 }
 
 // =========================================================================
@@ -636,7 +477,8 @@ void syncHandleKey(uint8_t keyCode, uint8_t modifiers) {
       break;
 
     case SyncState::SYNCING:
-      if (keyCode == HID_KEY_ESCAPE) {
+      if (keyCode == HID_KEY_ESCAPE &&
+          git_sync_get_state() != GIT_SYNC_IN_PROGRESS) {
         wifiSyncStop();
       }
       break;
@@ -689,9 +531,37 @@ void syncHandleKey(uint8_t keyCode, uint8_t modifiers) {
 void wifiSyncStart() {
   if (syncActive) return;
   syncActive = true;
+  gitSyncSucceeded = false;
+  returnToEditor = currentState == UIState::TEXT_EDITOR;
+  editorFileToReload[0] = '\0';
+  if (returnToEditor) {
+    const char* currentFile = editorGetCurrentFile();
+    if (currentFile[0]) {
+      strncpy(editorFileToReload, currentFile, sizeof(editorFileToReload) - 1);
+      editorFileToReload[sizeof(editorFileToReload) - 1] = '\0';
+      if (editorHasUnsavedChanges()) saveCurrentFile();
+      if (editorHasUnsavedChanges()) {
+        editorFileToReload[0] = '\0';
+        syncState = SyncState::DONE;
+        strlcpy(statusText, "Could not save note; Git sync cancelled",
+                sizeof(statusText));
+        doneStartMs = millis();
+        screenDirty = true;
+        return;
+      }
+    }
+  }
+  gitJobStarted = false;
   wifiPrefs.begin("wifi_creds", false);
+  wifiPrefsOpen = true;
   if (!wifiPrefs.isKey("wifi_count")) restoreWifiBackup();
-  resetSyncTracking();
+  if (!git_sync_is_configured()) {
+    syncState = SyncState::DONE;
+    strlcpy(statusText, "Create /git.cfg to configure Git sync", sizeof(statusText));
+    doneStartMs = millis();
+    screenDirty = true;
+    return;
+  }
 
   beginScan();
 
@@ -701,20 +571,31 @@ void wifiSyncStart() {
 void wifiSyncStop() {
   if (!syncActive) return;
 
-  stopHttpServer();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  if (git_sync_get_state() != GIT_SYNC_IN_PROGRESS) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
 
-  wifiPrefs.end();
+  if (wifiPrefsOpen) {
+    wifiPrefs.end();
+    wifiPrefsOpen = false;
+  }
   syncActive = false;
   networkCount = 0;
   passwordBuf[0] = '\0';
   passwordLen = 0;
   statusText[0] = '\0';
 
-  // Return to main menu
-  extern UIState currentState;
-  currentState = UIState::MAIN_MENU;
+  if (returnToEditor && editorFileToReload[0]) {
+    refreshFileList();
+    loadFile(editorFileToReload);
+  } else if (returnToEditor) {
+    currentState = UIState::TEXT_EDITOR;
+  } else {
+    currentState = UIState::MAIN_MENU;
+  }
+  returnToEditor = false;
+  editorFileToReload[0] = '\0';
   screenDirty = true;
 
   DBG_PRINTLN("[SYNC] WiFi sync stopped");
@@ -733,12 +614,8 @@ void wifiSyncLoop() {
       break;
 
     case SyncState::SYNCING:
-      if (server) server->handleClient();
-      if (syncCompletePending) {
-        syncCompletePending = false;
-        enterDoneState();
-      } else if (millis() - lastHttpActivityMs > SYNC_TIMEOUT_MS) {
-        DBG_PRINTLN("[SYNC] Timeout — no HTTP activity for 60s");
+      if (gitJobStarted && (git_sync_get_state() == GIT_SYNC_SUCCESS ||
+                            git_sync_get_state() == GIT_SYNC_ERROR)) {
         enterDoneState();
       }
       break;
@@ -751,7 +628,7 @@ void wifiSyncLoop() {
       break;
 
     case SyncState::SAVE_PROMPT:
-      // Server is NOT running during save prompt (will start after user responds)
+      // Git sync starts after the user responds to the credential prompt.
       break;
 
     default:
@@ -807,14 +684,6 @@ const char* getSyncStatusText() {
   return statusText;
 }
 
-int getSyncFilesSent() {
-  return filesSent;
-}
-
-int getSyncFilesReceived() {
-  return filesReceived;
-}
-
-bool isPcConnected() {
-  return pcConnected;
+bool didGitSyncSucceed() {
+  return gitSyncSucceeded;
 }

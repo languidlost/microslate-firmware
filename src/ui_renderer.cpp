@@ -5,6 +5,7 @@
 #include "ble_keyboard.h"
 #include "wifi_sync.h"
 #include "keyboard_layout.h"
+#include "git_sync.h"
 
 #include <GfxRenderer.h>
 #include <HalGPIO.h>
@@ -73,6 +74,7 @@ extern char renameBuffer[];
 extern int renameBufferLen;
 extern bool editorFindMode;
 extern char findBuffer[];
+extern char gitSyncNotice[];
 
 void rendererSetup(GfxRenderer& renderer) {
   renderer.insertFont(FONT_LARGE, ns16Family);
@@ -186,7 +188,7 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   renderer.drawCenteredText(FONT_BODY, 30, "MicroSlate", tc, EpdFontFamily::BOLD);
 
   // Menu items (base + dynamically detected OTA apps)
-  static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Sync"};
+  static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Git Sync"};
   int menuCount = 4 + otaAppCount;
   for (int i = 0; i < menuCount; i++) {
     int yPos = 90 + (i * 45);
@@ -254,7 +256,11 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   // Footer
   clippedLine(renderer, 5, sh - footerH - 2, sw - 5, sh - footerH - 2, tc);
   if (deleteConfirmPending && fc > 0) {
-    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4, "Delete? Enter:Yes  Esc:No", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4,
+                    "Enter:Delete synced file  Esc:Cancel", 0, tc);
+  } else if (gitSyncNotice[0]) {
+    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4,
+                    gitSyncNotice, sw - 20, tc);
   } else {
     drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4,
                     "Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
@@ -895,7 +901,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Header
-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Sync", 0, tc, EpdFontFamily::BOLD);
+  drawClippedText(renderer, FONT_SMALL, 10, 5, "Git Sync", 0, tc, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
 
@@ -993,69 +999,19 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
     }
 
     case SyncState::SYNCING: {
-      const char* ip = getSyncStatusText();
-      drawClippedText(renderer, FONT_SMALL, 20, 42, ip, sw - 40, tc, EpdFontFamily::BOLD);
-
-      int sent    = getSyncFilesSent();
-      bool pcConn = isPcConnected();
-
-      // Build the stage list. Static so string pointers remain valid after this scope.
-      static char fileStageText[MAX_FILES][16];
-      static struct { const char* text; bool done; } stages[MAX_FILES + 3];
-      int numStages = 0;
-
-      auto push = [&](const char* text, bool done) {
-        if (numStages < MAX_FILES + 3) stages[numStages++] = { text, done };
-      };
-
-      push("Connected to WiFi", true);
-      push("PC connected",      pcConn);
-
-      if (pcConn) {
-        for (int i = 0; i < sent && i < MAX_FILES; i++) {
-          snprintf(fileStageText[i], sizeof(fileStageText[i]), "File %d sent", i + 1);
-          push(fileStageText[i], true);
-        }
-        push("Sync complete", false);
-      }
-
-      // Display with auto-scroll: keep last [x] + next [-] in view
-      constexpr int lineH   = 22;
-      constexpr int listTop = 62;
-      constexpr int footerH = 32;
-      int maxVisible = (sh - listTop - footerH) / lineH;
-
-      int lastDone = 0;
-      for (int i = 0; i < numStages; i++) {
-        if (stages[i].done) lastDone = i;
-      }
-      int startIdx = 0;
-      if (numStages > maxVisible) {
-        startIdx = lastDone - maxVisible + 2;
-        if (startIdx < 0) startIdx = 0;
-        if (startIdx + maxVisible > numStages) startIdx = numStages - maxVisible;
-      }
-
-      for (int i = startIdx; i < numStages && (i - startIdx) < maxVisible; i++) {
-        int yPos = listTop + (i - startIdx) * lineH;
-        char line[52];
-        snprintf(line, sizeof(line), "%s %s",
-                 stages[i].done ? "[x]" : "[-]", stages[i].text);
-        drawClippedText(renderer, FONT_SMALL, 15, yPos, line, sw - 25, tc);
-      }
-
-      // Footer
-      constexpr int bm = 28;
-      clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
-      char countStr[32];
-      snprintf(countStr, sizeof(countStr), "Sent: %d   Esc: Cancel", sent);
-      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 4, countStr, sw - 20, tc);
+      const char* status = getSyncStatusText();
+      drawClippedText(renderer, FONT_UI, 20, 72, status[0] ? status : "Starting Git sync...",
+                      sw - 40, tc, EpdFontFamily::BOLD);
+      drawClippedText(renderer, FONT_SMALL, 20, 108,
+                      "Syncing repository; please wait", sw - 40, tc);
       break;
     }
 
     case SyncState::DONE: {
       const char* summary = getSyncStatusText();
-      drawClippedText(renderer, FONT_SMALL, 20, 50, "Sync Complete", 0, tc, EpdFontFamily::BOLD);
+      const bool success = didGitSyncSucceed();
+      drawClippedText(renderer, FONT_SMALL, 20, 50, success ? "Git Sync Complete" : "Git Sync Failed",
+                      sw - 40, tc, EpdFontFamily::BOLD);
       drawClippedText(renderer, FONT_UI, 20, 85, summary, sw - 40, tc);
       drawClippedText(renderer, FONT_SMALL, 20, 125, "Returning to menu...", 0, tc);
       break;

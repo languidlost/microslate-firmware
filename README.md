@@ -23,7 +23,7 @@ A dedicated writing firmware for the **Xteink X4** e-paper device. Pairs with an
 - **Dark Mode** — inverted display
 - **Display Orientation** — portrait, landscape, and inverted variants
 - **Power Management** — ESP-IDF light sleep between loop iterations (CPU drops to 10MHz), BLE modem sleep keeps the radio alive, SD card sleeps between accesses, display analog circuits power down after each refresh, and the device enters deep sleep after 5 minutes of inactivity
-- **WiFi Sync** — one-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. Read-only server — nothing on the device can be modified over the network
+- **Git Sync** — native Git client that commits notes to an SD-card repository and synchronizes with any smart-HTTP Git host over WiFi
 - **Standalone Build** — all libraries are bundled in the repo; no sibling projects required
 - **Dual-Boot** — optional combined firmware that includes CrossPoint (an e-reader) in a second OTA slot. A "CrossPoint" entry appears in the main menu; selecting it reboots into the reader. CrossPoint gains a reciprocal "MicroSlate" entry. Both apps work normally when flashed standalone.
 - **Settings Backup** — BLE pairing info, WiFi credentials, and UI preferences are backed up to the SD card as JSON files. They are silently restored after a firmware flash so you don't need to re-pair your keyboard or re-enter WiFi passwords.
@@ -86,7 +86,7 @@ The device remembers paired keyboards (up to 4) and reconnects automatically on 
 | Left / Right | Also navigate (convenient in landscape) |
 | Enter | Select |
 
-Options: **Browse Notes**, **New Note**, **Settings**, **Sync** — and **CrossPoint** if the dual-boot firmware is installed
+Options: **Browse Notes**, **New Note**, **Settings**, **Git Sync** — and **CrossPoint** if the dual-boot firmware is installed
 
 ### File Browser
 
@@ -114,6 +114,7 @@ When delete is pending, the footer shows `Delete? Enter:Yes  Esc:No`. Press Ente
 | Ctrl+A | Select all |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste |
 | Ctrl+F | Find (Enter = next match, Esc = close) |
+| Ctrl+G | Start Git Sync |
 | Ctrl+K | Cycle keyboard layout (US QWERTY → Russian → German) |
 | Ctrl+W | Toggle word count |
 | Ctrl+S | Save manually |
@@ -191,52 +192,40 @@ To pair a second keyboard, go to **Settings → Bluetooth**, scan, and connect. 
 
 A scan runs for 5 seconds and then stops. Up to 10 nearby devices are shown with name, address, and signal strength. By default the list shows every nearby device; use the inline keyboards-only toggle to hide devices that don't look like keyboards. If a keyboard drops out, the device retries the connection about every 5 seconds, so it reconnects soon after the keyboard comes back.
 
-### WiFi Sync
+### Git Sync
 
-Back up all notes from the device to your PC over WiFi. The device and PC must be on the **same WiFi network**.
+The device runs Git's smart HTTP protocol directly; no PC helper or Python
+installation is needed. Create `/git.cfg` on the SD card with the repository
+URL and a token that has access to the repository:
 
-#### One-time PC setup
-
-1. Install [Python 3](https://www.python.org/downloads/) if you don't have it
-2. Install the required library:
-   ```bash
-   pip install requests
-   ```
-3. Run the installer for your platform:
-
-**Windows** — double-click **`sync\install_sync.bat`**
-
-**macOS / Linux** — run in a terminal:
-```bash
-chmod +x sync/install_sync.sh && sync/install_sync.sh
+```ini
+repo_url=https://github.com/user/repo
+branch=main
+token=your-access-token
+username=x-access-token
+path=notes/
+author_name=Jane Doe
+author_email=jane@example.com
 ```
 
-That's it. The script starts immediately and will run silently in the background on every login. When a sync completes, a desktop notification lists the files that were downloaded (Windows balloon, macOS notification, or Linux `notify-send`). Notes are saved to `Documents/MicroSlate Notes/` by default (edit `LOCAL_DIR` in `microslate_sync.py` to change).
+`repo_url` and `token` are required. `branch` defaults to `main`; `path`
+selects an optional remote subdirectory; and the author fields default to
+`Draftling <draftling@localhost>`. The client syncs the flat document files
+(`.md`, `.fountain`, and `.txt`) in the device's `/notes/` directory. WiFi
+credentials are saved by the device, and the first sync can scan for a network
+and prompt for its password.
 
-To stop auto-start later:
-- **Windows** — double-click **`sync\uninstall_sync.bat`**
-- **macOS / Linux** — run `sync/uninstall_sync.sh`
+Select **Git Sync** from the main menu, or press **Ctrl+G** in the editor.
+The first sync fetches the remote history, then commits, merges, and pushes
+local changes. Concurrent edits are merged per file; overlapping changes are
+committed with conflict markers so they are never discarded. Files can only be
+deleted from the browser after their current contents have been synced to the
+remote. Git sync is also attempted before automatic or button-triggered deep
+sleep when a repository is configured.
 
-#### Syncing
-
-1. Select **Sync** from the main menu on the device
-2. **First time:** pick your WiFi network and enter the password. The device asks to save credentials.
-3. **After that:** the device auto-connects — just press Sync and wait
-4. The device syncs automatically once connected — a progress log is shown on screen
-5. When done, the device shows a summary and turns WiFi off automatically. A desktop notification lists the downloaded files
-
-If the sync script isn't running, you can start it manually:
-```bash
-python3 sync/microslate_sync.py
-```
-
-#### How sync works
-
-- One-way backup: device → PC. Nothing is ever uploaded or deleted.
-- Files already on the PC with the same name and size are skipped
-- Files deleted from the device are **not** deleted from the PC — they stay as a backup
-- The device HTTP server is **read-only** — no one on the network can modify or delete files
-- WiFi turns off automatically after sync completes or after 60 seconds of no activity
+The device stores its Git metadata on the SD card. See
+[`git-sync.md`](./git-sync.md) for protocol details, supported hosts, merge
+behavior, and limitations.
 
 #### Sync controls
 
@@ -244,7 +233,7 @@ python3 sync/microslate_sync.py
 |-----|--------|
 | Up / Down | Navigate network list |
 | Enter | Select network / confirm |
-| Esc | Cancel / back |
+| Esc | Cancel before sync starts / return after completion |
 
 ## File Format
 
@@ -264,14 +253,11 @@ xteink-writer-firmware/
 │   ├── text_editor.cpp   — text buffer and cursor management
 │   ├── file_manager.cpp  — SD card file operations
 │   ├── ui_renderer.cpp   — screen rendering for all UI modes
-│   ├── wifi_sync.cpp     — WiFi sync server and state machine
+│   ├── wifi_sync.cpp     — WiFi selection and Git sync UI state
+│   ├── git_sync.cpp      — Git config, commits, fetch/rebase/merge, and push
+│   ├── git_*.c           — Git object store, packfile, transport, and merge
+│   ├── git_fs.cpp        — SD-card filesystem adapter for the Git client
 │   └── config.h          — enums, buffer sizes, constants
-├── sync/
-│   ├── microslate_sync.py   — PC sync script (Python, cross-platform)
-│   ├── install_sync.bat     — register auto-start on Windows login
-│   ├── uninstall_sync.bat   — remove auto-start on Windows
-│   ├── install_sync.sh      — register auto-start on macOS / Linux
-│   └── uninstall_sync.sh    — remove auto-start on macOS / Linux
 ├── lib/                  — all hardware/display libraries (bundled)
 │   ├── GfxRenderer/
 │   ├── EpdFont/
