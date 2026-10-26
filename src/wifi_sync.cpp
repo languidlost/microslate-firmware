@@ -3,6 +3,7 @@
 #include "file_manager.h"
 #include "sd_backup.h"
 #include "git_sync.h"
+#include "text_editor.h"
 
 #include <Arduino.h>
 #include <WiFi.h>

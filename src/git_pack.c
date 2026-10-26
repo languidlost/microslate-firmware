@@ -8,7 +8,7 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 
-#include "miniz.h"
+#include <rom/miniz.h>
 
 static const char *TAG = "git.pack";
 
@@ -105,7 +105,8 @@ static esp_err_t inflate_stream(git_file *fp, long file_end,
             break;
         }
         if (st < TINFL_STATUS_DONE) { ret = ESP_FAIL; break; }
-        if (st == TINFL_STATUS_NEEDS_MORE_INPUT && in_pos == in_have && feof(fp)) {
+        if (st == TINFL_STATUS_NEEDS_MORE_INPUT && in_pos == in_have &&
+            git_fs_tell(fp) >= file_end) {
             ret = ESP_FAIL;
             break;
         }

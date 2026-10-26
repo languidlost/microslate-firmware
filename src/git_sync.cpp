@@ -34,7 +34,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_heap_caps.h>
-#include <esp_netif_sntp.h>
+#include <esp_sntp.h>
 #include <mbedtls/base64.h>
 #include <WiFi.h>
 
@@ -127,14 +127,23 @@ static void ensure_time(void)
      * that drift each time instead of trusting a carried-over guess. */
     s_time_synced = true;
 
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("2.pool.ntp.org");
-    if (esp_netif_sntp_init(&cfg) == ESP_OK) {
-        if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(6000)) == ESP_OK) {
-            ESP_LOGI(TAG, "SNTP time acquired");
-        } else {
-            ESP_LOGW(TAG, "SNTP sync timed out, using RTC-tracked time");
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "2.pool.ntp.org");
+    esp_sntp_init();
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(6000);
+    bool synced = false;
+    while (xTaskGetTickCount() < deadline) {
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            synced = true;
+            break;
         }
-        esp_netif_sntp_deinit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    esp_sntp_stop();
+    if (synced) {
+        ESP_LOGI(TAG, "SNTP time acquired");
+    } else {
+        ESP_LOGW(TAG, "SNTP sync timed out, using RTC-tracked time");
     }
 }
 

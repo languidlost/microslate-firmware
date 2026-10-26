@@ -16,7 +16,7 @@
 #include <mbedtls/sha1.h>
 #endif
 
-#include "miniz.h"
+#include <rom/miniz.h>
 
 static const char *TAG = "git.util";
 

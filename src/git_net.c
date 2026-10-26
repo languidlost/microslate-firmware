@@ -9,7 +9,6 @@
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
-#include <esp_netif.h>
 
 static const char *TAG = "git.net";
 
@@ -49,8 +48,7 @@ static int hex4(const char *p)
 /* ------------------------------------------------------------------ */
 
 static esp_http_client_handle_t http_begin(const git_remote *r, const char *url,
-                                           esp_http_client_method_t method,
-                                           esp_http_client_addr_type_t addr_type)
+                                           esp_http_client_method_t method)
 {
     esp_http_client_config_t cfg = {0};
     cfg.url = url;
@@ -60,7 +58,6 @@ static esp_http_client_handle_t http_begin(const git_remote *r, const char *url,
     cfg.buffer_size = 4096;
     cfg.buffer_size_tx = 2048;
     cfg.keep_alive_enable = true;
-    cfg.addr_type = addr_type;
 
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return NULL;
@@ -73,44 +70,27 @@ static esp_http_client_handle_t http_begin(const git_remote *r, const char *url,
     return c;
 }
 
-/* Open a connection to the Git server, preferring its AAAA record
- * when our own WiFi has a global IPv6 address (dual-stack network).
- * esp-tls's getaddrinfo() hint is a hard filter, not a preference --
- * asking for AF_INET6 fails outright if the host has no AAAA record --
- * so on failure this transparently retries with the default (system)
- * resolution order instead of giving up. `extra` (if non-NULL) sets
- * any request-specific headers that must land on *every* attempt,
- * since each retry uses a brand new esp_http_client_handle_t. */
+/* Open a connection using ESP-IDF's default address resolution. This
+ * supports the address families available to the configured IDF version.
+ * `extra` (if non-NULL) sets request-specific headers before opening. */
 typedef void (*http_extra_headers_fn)(esp_http_client_handle_t c);
-
-static bool wifi_has_global_ipv6(void)
-{
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    esp_ip6_addr_t addr;
-    return netif && esp_netif_get_ip6_global(netif, &addr) == ESP_OK;
-}
 
 static esp_err_t http_open(esp_http_client_handle_t *out, const git_remote *r,
                            const char *url, esp_http_client_method_t method,
                            int write_len, http_extra_headers_fn extra)
 {
-    bool try_v6 = wifi_has_global_ipv6();
-    for (int attempt = 0; attempt < (try_v6 ? 2 : 1); attempt++) {
-        esp_http_client_addr_type_t at =
-            (attempt == 0 && try_v6) ? HTTP_ADDR_TYPE_INET6 : HTTP_ADDR_TYPE_UNSPEC;
-        esp_http_client_handle_t c = http_begin(r, url, method, at);
-        if (!c) { *out = NULL; return ESP_FAIL; }
-        if (extra) extra(c);
-        esp_err_t err = esp_http_client_open(c, write_len);
-        if (err == ESP_OK) { *out = c; return ESP_OK; }
-        ESP_LOGW(TAG, "%s: connect via %s failed (%s)%s", url,
-                 at == HTTP_ADDR_TYPE_INET6 ? "AAAA" : "default resolution",
-                 esp_err_to_name(err),
-                 (attempt == 0 && try_v6) ? ", retrying via A" : "");
-        esp_http_client_cleanup(c);
+    esp_http_client_handle_t c = http_begin(r, url, method);
+    if (!c) { *out = NULL; return ESP_FAIL; }
+    if (extra) extra(c);
+    esp_err_t err = esp_http_client_open(c, write_len);
+    if (err == ESP_OK) {
+        *out = c;
+        return ESP_OK;
     }
+    ESP_LOGW(TAG, "%s: connection failed (%s)", url, esp_err_to_name(err));
+    esp_http_client_cleanup(c);
     *out = NULL;
-    return ESP_FAIL;
+    return err;
 }
 
 /* Hex+ASCII dump of the first bytes of a buffer, for protocol debugging. */
